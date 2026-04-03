@@ -15,4 +15,3 @@ model.train(resume=True)
 #             device=[0, 1],
 #             workers=8,
 #             )
-

@@ -13,9 +13,10 @@ model_cache: dict[str, YOLO] = {}          # 模型缓存，key 为 model_id
 model_cache_lock = threading.Lock()
 
 detect_thread: Thread | None = None
-latest_result = None
-result_lock = threading.Lock()
 is_running = False
+
+result_queue: asyncio.Queue[dict] | None = None  # 检测结果队列
+main_loop: asyncio.AbstractEventLoop | None = None  # 主事件循环引用
 
 import logging
 logging.getLogger("ultralytics").setLevel(logging.ERROR)
@@ -45,8 +46,9 @@ def resolve_model(model_id: str) -> YOLO:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 不再强制预热，按需加载即可
-    # 如果希望预热某个默认模型，可在此调用 resolve_model("yolov8n")
+    global result_queue, main_loop
+    result_queue = asyncio.Queue(maxsize=30)   # 最多缓存30帧，防止堆积
+    main_loop = asyncio.get_event_loop()       # 保存主事件循环供检测线程使用
     yield
     stop_detect()
     with model_cache_lock:
@@ -58,8 +60,26 @@ app = FastAPI(lifespan=lifespan)
 
 
 # ─── 检测线程 ────────────────────────────────────────────
+def _push_result(data: dict):
+    """在检测线程中调用，将结果安全地放入异步队列"""
+    if main_loop is None or result_queue is None:
+        return
+    asyncio.run_coroutine_threadsafe(_enqueue(data), main_loop)
+
+
+async def _enqueue(data: dict):
+    """异步协程：队列满时丢弃最旧的帧，保证实时性"""
+    assert result_queue is not None
+    if result_queue.full():
+        try:
+            result_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+    await result_queue.put(data)
+
+
 def detect_worker(url: str, model_id: str):
-    global is_running, latest_result
+    global is_running
 
     try:
         yolo_model = resolve_model(model_id)
@@ -105,8 +125,8 @@ def detect_worker(url: str, model_id: str):
                     else {"count": 0, "model": model_id, "boxes": []}
                 )
 
-                with result_lock:
-                    latest_result = data
+                # 有结果立即推送到队列，WebSocket 会即时收到
+                _push_result(data)
 
         except Exception as e:
             if not is_running:
@@ -116,10 +136,9 @@ def detect_worker(url: str, model_id: str):
 
 
 def stop_detect():
-    global is_running, detect_thread, latest_result
+    global is_running, detect_thread
     is_running = False
     detect_thread = None
-    latest_result = None
 
 
 # ─── 接口 ────────────────────────────────────────────────
@@ -129,7 +148,7 @@ def start_stream(url: str, model: str = "visdrone"):
     参数:
       url   - 视频流地址
       model - 模型标识，支持:
-              • 别名:  "person" / "car" / "helmet"
+              • 别名:  "visdrone"
               • 路径:  "runs/detect/train2/weights/best.pt"
               • 官方名: "yolov8n" / "yolov8s" 等
     """
@@ -164,21 +183,22 @@ def list_models():
 @app.websocket("/yolo/ws/results")
 async def websocket_results(websocket: WebSocket):
     await websocket.accept()
-    last_sent = None
+    assert result_queue is not None
 
     try:
         while True:
-            with result_lock:
-                current = latest_result
-
-            if current is not None and current is not last_sent:
-                await websocket.send_json(current)
-                last_sent = current
-            else:
-                await asyncio.sleep(0.01)
+            try:
+                # 阻塞等待队列中的新结果，有结果立即推送
+                # 30秒超时后发一次心跳，维持连接
+                data = await asyncio.wait_for(result_queue.get(), timeout=30)
+                await websocket.send_json(data)
+            except asyncio.TimeoutError:
+                # 30秒无检测结果，发心跳防止连接断开
+                await websocket.send_json({"type": "heartbeat"})
 
     except WebSocketDisconnect:
         print("WebSocket 客户端断开")
+        stop_detect()
 
 
 if __name__ == "__main__":
