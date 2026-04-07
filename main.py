@@ -1,42 +1,37 @@
 import asyncio
+import subprocess
 import time
 import threading
 from contextlib import asynccontextmanager
 from threading import Thread
 
+import cv2
+import numpy as np
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from ultralytics import YOLO
 
+import logging
+logging.getLogger("ultralytics").setLevel(logging.ERROR)
+
 # ─── 全局状态 ────────────────────────────────────────────
-model_cache: dict[str, YOLO] = {}          # 模型缓存，key 为 model_id
+model_cache: dict[str, YOLO] = {}
 model_cache_lock = threading.Lock()
 
 detect_thread: Thread | None = None
 is_running = False
 
-result_queue: asyncio.Queue[dict] | None = None  # 检测结果队列
-main_loop: asyncio.AbstractEventLoop | None = None  # 主事件循环引用
-
-import logging
-logging.getLogger("ultralytics").setLevel(logging.ERROR)
+latest_result: dict | None = None
+latest_result_lock = threading.Lock()
+new_result_event: asyncio.Event | None = None
+main_loop: asyncio.AbstractEventLoop | None = None
 
 
 def resolve_model(model_id: str) -> YOLO:
-    """
-    支持两种格式：
-    - 路径：  "runs/detect/train2/weights/best.pt"
-    - 名称：  "yolov8n" / "yolov8s" 等 ultralytics 内置名，
-              或自定义别名（可在下方 ALIAS 表中扩展）
-    同一 model_id 只加载一次，后续从缓存取。
-    """
     ALIAS: dict[str, str] = {
-        # 业务别名 → 实际权重路径，按需扩展
-        "visdrone":  "runs/detect/train5/weights/best.pt",
+        "visdrone": "runs/detect/train3/weights/best.pt",
     }
-
-    resolved = ALIAS.get(model_id, model_id)   # 别名 → 路径/官方名
-
+    resolved = ALIAS.get(model_id, model_id)
     with model_cache_lock:
         if resolved not in model_cache:
             print(f"加载模型: {resolved}")
@@ -44,11 +39,25 @@ def resolve_model(model_id: str) -> YOLO:
         return model_cache[resolved]
 
 
+def probe_resolution(url: str, fallback_w=2880, fallback_h=1620) -> tuple[int, int]:
+    """用 cv2 探测流分辨率，失败则返回 fallback"""
+    try:
+        cap = cv2.VideoCapture(url)
+        W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        if W > 0 and H > 0:
+            return W, H
+    except Exception:
+        pass
+    return fallback_w, fallback_h
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global result_queue, main_loop
-    result_queue = asyncio.Queue(maxsize=30)   # 最多缓存30帧，防止堆积
-    main_loop = asyncio.get_event_loop()       # 保存主事件循环供检测线程使用
+    global new_result_event, main_loop
+    new_result_event = asyncio.Event()
+    main_loop = asyncio.get_event_loop()
     yield
     stop_detect()
     with model_cache_lock:
@@ -59,25 +68,16 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-# ─── 检测线程 ────────────────────────────────────────────
+# ─── 结果推送 ────────────────────────────────────────────
 def _push_result(data: dict):
-    """在检测线程中调用，将结果安全地放入异步队列"""
-    if main_loop is None or result_queue is None:
-        return
-    asyncio.run_coroutine_threadsafe(_enqueue(data), main_loop)
+    global latest_result
+    with latest_result_lock:
+        latest_result = data
+    if main_loop and new_result_event:
+        main_loop.call_soon_threadsafe(new_result_event.set)
 
 
-async def _enqueue(data: dict):
-    """异步协程：队列满时丢弃最旧的帧，保证实时性"""
-    assert result_queue is not None
-    if result_queue.full():
-        try:
-            result_queue.get_nowait()
-        except asyncio.QueueEmpty:
-            pass
-    await result_queue.put(data)
-
-
+# ─── 检测线程 ────────────────────────────────────────────
 def detect_worker(url: str, model_id: str):
     global is_running
 
@@ -91,23 +91,44 @@ def detect_worker(url: str, model_id: str):
     is_running = True
 
     while is_running:
+        proc = None
         try:
-            print(f"连接直播流: {url}，使用模型: {model_id}")
-            results = yolo_model.predict(
-                source=url,
-                imgsz=1920,
-                conf=0.5,
-                device=0,
-                half=True,
-                stream=True,
-                verbose=False,
-                save=True,
-                vid_stride=1,
-            )
-            for result in results:
-                if not is_running:
+            W, H = probe_resolution(url)
+            print(f"连接流: {url}，分辨率: {W}x{H}，模型: {model_id}")
+
+            cmd = [
+                "ffmpeg",
+                "-fflags", "nobuffer",
+                "-flags", "low_delay",
+                "-i", url,
+                "-pix_fmt", "bgr24",
+                "-vcodec", "rawvideo",
+                "-an",
+                "-f", "rawvideo",
+                "pipe:1",
+            ]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            if proc.stdout is None:
+                raise RuntimeError("ffmpeg stdout pipe is not available")
+            frame_size = W * H * 3
+
+            while is_running:
+                raw = proc.stdout.read(frame_size)
+                if len(raw) < frame_size:
+                    print("流中断或结束")
                     break
-                boxes = result.boxes
+
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape((H, W, 3))
+                results = yolo_model.predict(
+                    source=frame,
+                    imgsz=1920,
+                    conf=0.5,
+                    device=0,
+                    half=True,
+                    save=True,
+                    verbose=False,
+                )
+                boxes = results[0].boxes
                 data = (
                     {
                         "count": len(boxes),
@@ -116,7 +137,7 @@ def detect_worker(url: str, model_id: str):
                             {
                                 "xyxy": b.xyxy[0].tolist(),
                                 "conf": float(b.conf[0]),
-                                "cls":  int(b.cls[0]),
+                                "cls": int(b.cls[0]),
                             }
                             for b in boxes
                         ],
@@ -124,14 +145,18 @@ def detect_worker(url: str, model_id: str):
                     if boxes is not None and len(boxes) > 0
                     else {"count": 0, "model": model_id, "boxes": []}
                 )
-
-                # 有结果立即推送到队列，WebSocket 会即时收到
                 _push_result(data)
 
         except Exception as e:
             if not is_running:
                 break
-            print(f"流中断: {e}，5秒后重连...")
+            print(f"异常: {e}，5秒后重连...")
+        finally:
+            if proc:
+                proc.kill()
+                proc.wait()
+
+        if is_running:
             time.sleep(5)
 
 
@@ -144,25 +169,11 @@ def stop_detect():
 # ─── 接口 ────────────────────────────────────────────────
 @app.post("/yolo/start")
 def start_stream(url: str, model: str = "visdrone"):
-    """
-    参数:
-      url   - 视频流地址
-      model - 模型标识，支持:
-              • 别名:  "visdrone"
-              • 路径:  "runs/detect/train2/weights/best.pt"
-              • 官方名: "yolov8n" / "yolov8s" 等
-    """
     global detect_thread
-
     if detect_thread and detect_thread.is_alive():
         return {"status": "already_running"}
-
     stop_detect()
-    detect_thread = Thread(
-        target=detect_worker,
-        args=(url, model),
-        daemon=True,
-    )
+    detect_thread = Thread(target=detect_worker, args=(url, model), daemon=True)
     detect_thread.start()
     return {"status": "started", "url": url, "model": model}
 
@@ -175,7 +186,6 @@ def stop_stream():
 
 @app.get("/yolo/models")
 def list_models():
-    """查看当前已缓存（已加载）的模型"""
     with model_cache_lock:
         return {"loaded_models": list(model_cache.keys())}
 
@@ -183,18 +193,26 @@ def list_models():
 @app.websocket("/yolo/ws/results")
 async def websocket_results(websocket: WebSocket):
     await websocket.accept()
-    assert result_queue is not None
+    event = new_result_event
+    if event is None:
+        await websocket.send_json({"type": "error", "message": "result event not initialized"})
+        await websocket.close(code=1011)
+        return
 
     try:
         while True:
             try:
-                # 阻塞等待队列中的新结果，有结果立即推送
-                # 30秒超时后发一次心跳，维持连接
-                data = await asyncio.wait_for(result_queue.get(), timeout=30)
-                await websocket.send_json(data)
+                await asyncio.wait_for(event.wait(), timeout=30)
             except asyncio.TimeoutError:
-                # 30秒无检测结果，发心跳防止连接断开
                 await websocket.send_json({"type": "heartbeat"})
+                continue
+
+            event.clear()
+            with latest_result_lock:
+                data = latest_result
+
+            if data:
+                await websocket.send_json(data)
 
     except WebSocketDisconnect:
         print("WebSocket 客户端断开")
