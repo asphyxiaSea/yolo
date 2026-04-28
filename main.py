@@ -29,7 +29,7 @@ main_loop: asyncio.AbstractEventLoop | None = None
 
 def resolve_model(model_id: str) -> YOLO:
     ALIAS: dict[str, str] = {
-        "visdrone": "runs/detect/train6/weights/best.pt",
+        "visdrone": "runs/detect/visdrone_yolov26n_v1/weights/best.pt",
     }
     resolved = ALIAS.get(model_id, model_id)
     with model_cache_lock:
