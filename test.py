@@ -1,51 +1,75 @@
-# import subprocess
-# import numpy as np
-# import time
-# from ultralytics import YOLO
+import argparse
+import asyncio
+import json
+import urllib.parse
+import urllib.request
 
-# URL = "http://183.230.196.249:18000/hls/H-87b4bcfca291f8bb/H-87b4bcfca291f8bb_live.m3u8"
-# W, H = 2880, 1620
 
-# cmd = [
-#     "ffmpeg",
-#     "-fflags", "nobuffer",
-#     "-flags", "low_delay",
-#     "-i", URL,
-#     "-pix_fmt", "bgr24",
-#     "-vcodec", "rawvideo",
-#     "-an",
-#     "-f", "rawvideo",
-#     "pipe:1",
-# ]
+def start_stream(base_url: str, stream_url: str, model: str, mode: str) -> dict:
+	query = urllib.parse.urlencode({"url": stream_url, "model": model, "mode": mode})
+	with urllib.request.urlopen(f"{base_url}/yolo/start?{query}", data=b"") as resp:
+		return json.loads(resp.read().decode("utf-8"))
 
-# print("加载模型...")
-# yolo_model = YOLO("runs/detect/train5/weights/best.pt")
 
-# print("启动 ffmpeg...")
-# t = time.time()
-# proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+def stop_stream(base_url: str) -> dict:
+	with urllib.request.urlopen(f"{base_url}/yolo/stop", data=b"") as resp:
+		return json.loads(resp.read().decode("utf-8"))
 
-# frame_size = W * H * 3
-# print("开始推理...")
 
-# for i in range(10):
-#     raw = proc.stdout.read(frame_size)
-#     if len(raw) < frame_size:
-#         print(f"第 {i} 帧：流中断，读到 {len(raw)} 字节")
-#         break
+async def recv_ws(ws_url: str, max_messages: int) -> None:
+	try:
+		import websockets
+	except ImportError:
+		print("缺少 websockets 包，请先安装: pip install websockets")
+		return
 
-#     frame = np.frombuffer(raw, dtype=np.uint8).reshape((H, W, 3))
-#     t_infer = time.time()
-#     results = yolo_model.predict(
-#         source=frame,
-#         imgsz=1920,
-#         conf=0.5,
-#         device=0,
-#         half=True,
-#         verbose=False,
-#     )
-#     boxes = results[0].boxes
-#     print(f"第 {i} 帧，距启动: {time.time()-t:.2f}s，推理: {time.time()-t_infer:.3f}s，检测数: {len(boxes)}")
+	received = 0
+	async with websockets.connect(ws_url, ping_interval=None) as ws:
+		while received < max_messages:
+			msg = await ws.recv()
+			data = json.loads(msg)
 
-# proc.kill()
-# proc.wait()
+			if data.get("type") == "heartbeat":
+				print("[heartbeat]")
+				continue
+
+			mode = data.get("mode")
+			count = data.get("count")
+			if mode == "pose":
+				people = data.get("people", [])
+				kp_counts = [p.get("valid_kp_count", 0) for p in people]
+				print(f"[pose] count={count}, valid_kp={kp_counts}")
+			elif mode == "detect":
+				boxes = data.get("boxes", [])
+				print(f"[detect] count={count}, boxes={len(boxes)}")
+			else:
+				print(f"[unknown] {data}")
+
+			received += 1
+
+
+async def main() -> None:
+	parser = argparse.ArgumentParser(description="YOLO realtime API smoke test")
+	parser.add_argument("--base-url", default="http://127.0.0.1:8008", help="FastAPI base URL")
+	parser.add_argument("--stream-url", required=True, help="RTSP/HLS/HTTP stream URL")
+	parser.add_argument("--model", default="pose26l", help="model id/path")
+	parser.add_argument("--mode", default="pose", choices=["auto", "detect", "pose"], help="inference mode")
+	parser.add_argument("--messages", type=int, default=5, help="number of result messages to receive")
+	args = parser.parse_args()
+
+	ws_url = args.base_url.replace("http://", "ws://").replace("https://", "wss://") + "/yolo/ws/results"
+
+	started = start_stream(args.base_url, args.stream_url, args.model, args.mode)
+	print("start:", started)
+	if started.get("status") not in {"started", "already_running"}:
+		return
+
+	try:
+		await recv_ws(ws_url, args.messages)
+	finally:
+		stopped = stop_stream(args.base_url)
+		print("stop:", stopped)
+
+
+if __name__ == "__main__":
+	asyncio.run(main())

@@ -25,11 +25,13 @@ latest_result: dict | None = None
 latest_result_lock = threading.Lock()
 new_result_event: asyncio.Event | None = None
 main_loop: asyncio.AbstractEventLoop | None = None
+POSE_KP_CONF_THRES = 0.3
 
 
 def resolve_model(model_id: str) -> YOLO:
     ALIAS: dict[str, str] = {
         "visdrone": "runs/detect/visdrone_yolov26n_v1/weights/best.pt",
+        "pose26l": "yolo26l-pose.pt",
     }
     resolved = ALIAS.get(model_id, model_id)
     with model_cache_lock:
@@ -37,6 +39,59 @@ def resolve_model(model_id: str) -> YOLO:
             print(f"加载模型: {resolved}")
             model_cache[resolved] = YOLO(resolved)
         return model_cache[resolved]
+
+
+def _safe_to_numpy(value):
+    if value is None:
+        return None
+    if hasattr(value, "cpu"):
+        return value.cpu().numpy()
+    return np.asarray(value)
+
+
+def _is_pose_model(model: YOLO, model_id: str) -> bool:
+    task = getattr(model, "task", "")
+    if task == "pose":
+        return True
+    return "pose" in model_id.lower()
+
+
+def _build_pose_payload(result, model_id: str, conf_thres: float) -> dict:
+    keypoints = result.keypoints
+    boxes = result.boxes
+
+    if keypoints is None or keypoints.xy is None:
+        return {"count": 0, "model": model_id, "mode": "pose", "people": []}
+
+    kp_xy = _safe_to_numpy(keypoints.xy)
+    kp_conf = _safe_to_numpy(keypoints.conf)
+    box_conf = _safe_to_numpy(boxes.conf) if boxes is not None and boxes.conf is not None else None
+    if kp_xy is None:
+        return {"count": 0, "model": model_id, "mode": "pose", "people": []}
+
+    people = []
+    for idx in range(len(kp_xy)):
+        person_xy = kp_xy[idx]
+        if kp_conf is not None:
+            person_conf = kp_conf[idx]
+        else:
+            person_conf = np.zeros((person_xy.shape[0],), dtype=np.float32)
+
+        people.append(
+            {
+                "keypoints_xy": person_xy.tolist(),
+                "keypoints_conf": person_conf.tolist(),
+                "valid_kp_count": int((person_conf >= conf_thres).sum()),
+                "person_score": float(box_conf[idx]) if box_conf is not None else None,
+            }
+        )
+
+    return {
+        "count": len(people),
+        "model": model_id,
+        "mode": "pose",
+        "people": people,
+    }
 
 
 def probe_resolution(url: str, fallback_w=2880, fallback_h=1620) -> tuple[int, int]:
@@ -78,7 +133,7 @@ def _push_result(data: dict):
 
 
 # ─── 检测线程 ────────────────────────────────────────────
-def detect_worker(url: str, model_id: str):
+def detect_worker(url: str, model_id: str, mode: str = "auto"):
     global is_running
 
     try:
@@ -87,6 +142,15 @@ def detect_worker(url: str, model_id: str):
         print(f"模型加载失败: {e}")
         is_running = False
         return
+
+    if mode == "pose":
+        is_pose = True
+    elif mode == "detect":
+        is_pose = False
+    else:
+        is_pose = _is_pose_model(yolo_model, model_id)
+    selected_mode = "pose" if is_pose else "detect"
+    print(f"推理模式: {selected_mode}")
 
     is_running = True
 
@@ -119,32 +183,45 @@ def detect_worker(url: str, model_id: str):
                     break
 
                 frame = np.frombuffer(raw, dtype=np.uint8).reshape((H, W, 3))
-                results = yolo_model.predict(
-                    source=frame,
-                    imgsz=1920,
-                    conf=0.5,
-                    device=0,
-                    half=True,
-                    save=True,
-                    verbose=False,
-                )
-                boxes = results[0].boxes
-                data = (
-                    {
-                        "count": len(boxes),
-                        "model": model_id,
-                        "boxes": [
-                            {
-                                "xyxy": b.xyxy[0].tolist(),
-                                "conf": float(b.conf[0]),
-                                "cls": int(b.cls[0]),
-                            }
-                            for b in boxes
-                        ],
-                    }
-                    if boxes is not None and len(boxes) > 0
-                    else {"count": 0, "model": model_id, "boxes": []}
-                )
+                if is_pose:
+                    results = yolo_model.predict(
+                        source=frame,
+                        imgsz=1280,
+                        conf=0.35,
+                        device=0,
+                        half=True,
+                        save=False,
+                        verbose=False,
+                    )
+                    data = _build_pose_payload(results[0], model_id=model_id, conf_thres=POSE_KP_CONF_THRES)
+                else:
+                    results = yolo_model.predict(
+                        source=frame,
+                        imgsz=1920,
+                        conf=0.5,
+                        device=0,
+                        half=True,
+                        save=True,
+                        verbose=False,
+                    )
+                    boxes = results[0].boxes
+                    data = (
+                        {
+                            "count": len(boxes),
+                            "model": model_id,
+                            "mode": "detect",
+                            "boxes": [
+                                {
+                                    "xyxy": b.xyxy[0].tolist(),
+                                    "conf": float(b.conf[0]),
+                                    "cls": int(b.cls[0]),
+                                }
+                                for b in boxes
+                            ],
+                        }
+                        if boxes is not None and len(boxes) > 0
+                        else {"count": 0, "model": model_id, "mode": "detect", "boxes": []}
+                    )
                 _push_result(data)
 
         except Exception as e:
@@ -168,14 +245,18 @@ def stop_detect():
 
 # ─── 接口 ────────────────────────────────────────────────
 @app.post("/yolo/start")
-def start_stream(url: str, model: str = "visdrone"):
+def start_stream(url: str, model: str = "visdrone", mode: str = "auto"):
     global detect_thread
+    mode = mode.lower().strip()
+    if mode not in {"auto", "detect", "pose"}:
+        return {"status": "invalid_mode", "supported": ["auto", "detect", "pose"]}
+
     if detect_thread and detect_thread.is_alive():
         return {"status": "already_running"}
     stop_detect()
-    detect_thread = Thread(target=detect_worker, args=(url, model), daemon=True)
+    detect_thread = Thread(target=detect_worker, args=(url, model, mode), daemon=True)
     detect_thread.start()
-    return {"status": "started", "url": url, "model": model}
+    return {"status": "started", "url": url, "model": model, "mode": mode}
 
 
 @app.post("/yolo/stop")
