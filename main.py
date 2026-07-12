@@ -8,9 +8,8 @@ from threading import Thread
 import cv2
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from ultralytics import YOLO
-
 import logging
 logging.getLogger("ultralytics").setLevel(logging.ERROR)
 
@@ -300,5 +299,69 @@ async def websocket_results(websocket: WebSocket):
         stop_detect()
 
 
+def mask_to_geojson(result, transform=None) -> dict | None:
+    """
+    将 YOLO 分割结果 (result.masks.xy) 转换为 GeoJSON FeatureCollection。
+    如果当前模型不是分割模型（没有 masks），返回 None，
+    而不是空 FeatureCollection —— 这样前端能区分「没检测到目标」和「这模型压根不做分割」。
+    """
+    masks = result.masks
+    if masks is None:
+        return None
+
+    boxes = result.boxes
+    features = []
+
+    for i, poly in enumerate(masks.xy):  # poly: (N, 2) ndarray，像素坐标 (x, y)
+        if len(poly) < 3:
+            continue
+
+        if transform is not None:
+            coords = [list(transform * (float(x), float(y))) for x, y in poly]
+        else:
+            coords = [[float(x), float(y)] for x, y in poly]
+
+        if coords[0] != coords[-1]:
+            coords.append(coords[0])
+
+        # boxes 和 masks 理论上一一对应，但防御性写法防止越界
+        cls_id = int(boxes.cls[i]) if boxes is not None and i < len(boxes) else None
+        conf = float(boxes.conf[i]) if boxes is not None and i < len(boxes) else None
+
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "Polygon", "coordinates": [coords]},
+            "properties": {"cls": cls_id, "conf": conf},
+        })
+
+    return {"type": "FeatureCollection", "features": features}
+
+
+@app.post("/yolo/predict")
+async def predict_image(
+    file: UploadFile = File(...),
+    model: str = Form("visdrone"),
+    conf: float = Form(0.35),
+):
+    img = cv2.imdecode(np.frombuffer(await file.read(), np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return {"error": "无法解码图片"}
+
+    yolo_model = YOLO(f"models/{model}.pt")
+    result = yolo_model.predict(source=img, conf=conf, save=False, verbose=False)[0]
+
+    boxes = result.boxes
+    kps = result.keypoints
+
+    return {
+        "count": len(boxes) if boxes is not None else 0,
+        "model": model,
+        "boxes": [
+            {"xyxy": b.xyxy[0].tolist(), "conf": float(b.conf[0]), "cls": int(b.cls[0])}
+            for b in boxes
+        ] if boxes is not None else [],
+        "keypoints": kps.xy.tolist() if kps is not None else None,
+        "segmentation": mask_to_geojson(result),  # 非分割模型时自动为 None
+    }
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8008)

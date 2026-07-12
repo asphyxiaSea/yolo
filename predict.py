@@ -117,7 +117,7 @@ def analyze_pose_results(results, conf_thres=0.3):
 			f"{bbox_area_arr.max():.1f}"
 		)
 
-model = YOLO("yolo26l-pose.pt")
+
 
 # detect
 # results = model.predict(
@@ -125,12 +125,10 @@ model = YOLO("yolo26l-pose.pt")
 #     conf=0.4,
 #     device=1,
 #     half=True,        # FP16推理，RTX5090必开
-#     stream=True,      # 流式处理，不占内存
 #     save=True,       
-#     verbose=False,    # 关掉每帧打印，减少IO开销
 # )
 
-
+model = YOLO("models/pose.pt")
 # pose
-results = model.predict("assets/pose.png", save=False)  # 自动保存到 runs/pose/predict/
-analyze_pose_results(results, conf_thres=0.3)
+results = model.predict("assets/pose.png", save=True)  # 自动保存到 runs/pose/predict/
+# analyze_pose_results(results, conf_thres=0.3)
