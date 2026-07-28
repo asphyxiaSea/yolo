@@ -4,3 +4,4 @@ datasets/
 assets/
 .vscode
 *.pyc
+models/

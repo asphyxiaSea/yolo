@@ -347,8 +347,8 @@ async def predict_image(
     if img is None:
         return {"error": "无法解码图片"}
 
-    yolo_model = YOLO(f"models/{model}.pt")
-    result = yolo_model.predict(source=img, conf=conf, save=False, verbose=False)[0]
+    yolo_model = YOLO(f"models/{model}/weights/best.pt")
+    result = yolo_model.predict(source=img, conf=conf, save=True, verbose=False)[0]
 
     boxes = result.boxes
     kps = result.keypoints
