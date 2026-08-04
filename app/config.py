@@ -2,9 +2,9 @@
 from ultralytics import RTDETR, YOLO
 
 MODEL_REGISTRY = {
-    "camellia_det": {"weights": "models/rtdetr_camellia.pt", "loader": RTDETR},
-    "field_seg": {"weights": "models/yolo_seg.pt", "loader": YOLO},
-    "worker_pose": {"weights": "models/yolo_pose.pt", "loader": YOLO},
+    "seg_corn": {"weights": "models/分割_玉米果穗/weights/best.pt", "loader": YOLO},
+    "检测_稻叶病害": {"weights": "models/检测_稻叶病害/weights/best.pt", "loader": YOLO},
+    "worker_pose": {"weights": "models/检测_油茶嫩芽_RTDETR_1920/weights/best.pt", "loader": RTDETR},
 }
 
 DEVICE = 1

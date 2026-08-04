@@ -9,8 +9,8 @@ from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
-from config import MODEL_REGISTRY, DEVICE, DEFAULT_IMGSZ, DEFAULT_CONF, MAX_STREAM_DURATION
-from inference import run_single_inference, build_stream_generator, parse_result, release_model
+from .config import MODEL_REGISTRY, DEVICE, DEFAULT_IMGSZ, DEFAULT_CONF, MAX_STREAM_DURATION
+from .inference import run_single_inference, build_stream_generator, parse_result, release_model
 
 app = FastAPI()
 
@@ -19,7 +19,7 @@ infer_semaphore = asyncio.Semaphore(1)  # 单图推理并发限制
 
 # ------------------ 单图推理接口 ------------------
 
-@app.post("/infer/{model_name}")
+@app.post("/custom/infer/{model_name}")
 async def infer_image(
     model_name: str,
     file: UploadFile = File(...),
@@ -58,7 +58,7 @@ stream_state = StreamState()
 stream_lock = asyncio.Lock()
 
 
-@app.get("/infer_stream/{model_name}")
+@app.get("/custom/infer_stream/{model_name}")
 async def infer_stream(
     model_name: str,
     source: str,
