@@ -36,21 +36,21 @@ class NoCacheStaticFiles(StaticFiles):
         return response
 
 
-# HLS推流输出的根目录,通过静态文件服务对外暴露在 /hls 路径下。
+# HLS推流输出的根目录,通过静态文件服务对外暴露在 /custom/hls 路径下。
 # 因为全局只允许一路实时推理,固定用一个子目录"live"即可,
-# 这样对外播放地址永远是同一个,不随model_name变化: /hls/live/index.m3u8
+# 这样对外播放地址永远是同一个,不随model_name变化: /custom/hls/live/index.m3u8
 HLS_ROOT = "/data/hls_output"  # 按实际服务器可写路径调整
 os.makedirs(os.path.join(HLS_ROOT, "live"), exist_ok=True)
-app.mount("/hls", NoCacheStaticFiles(directory=HLS_ROOT), name="hls")
+app.mount("/custom/hls", NoCacheStaticFiles(directory=HLS_ROOT), name="hls")
 
-# 检测到目标时保存的截图,通过静态文件服务对外暴露在 /snapshots 路径下,
+# 检测到目标时保存的截图,通过静态文件服务对外暴露在 /custom/snapshots 路径下,
 # 下游系统拿到SSE里的 "snapshot" 文件名后拼上这个前缀即可直接下载。
 # 只是临时给下游一个下载窗口,不做长期持久化 —— 后台线程会定期清理
 # 超过 SNAPSHOT_RETENTION_SECONDS 的旧文件,不需要手动维护磁盘空间。
 SNAPSHOT_ROOT = "/data/snapshots"  # 按实际服务器可写路径调整
 SNAPSHOT_RETENTION_SECONDS = 300   # 截图保留时长(秒),默认5分钟,按下游实际下载耗时调整
 os.makedirs(SNAPSHOT_ROOT, exist_ok=True)
-app.mount("/snapshots", StaticFiles(directory=SNAPSHOT_ROOT), name="snapshots")
+app.mount("/custom/snapshots", StaticFiles(directory=SNAPSHOT_ROOT), name="snapshots")
 
 
 def _snapshot_cleanup_loop():
@@ -130,9 +130,9 @@ async def infer_stream(
     imgsz: int = DEFAULT_IMGSZ,
     save_video_path: str | None = None,   # 传了就把标注后画面存成mp4,测试用
     save_video_fps: float = 5.0,           # 保存视频的播放fps,按实测吞吐大致填
-    target_fps: float = 3.0,       # 固定采样密度抽帧,如 1.0 表示每秒推理1次
+    target_fps: float | None = None,       # 固定采样密度抽帧,如 1.0 表示每秒推理1次
     push_hls: bool = False,                # True则同步把标注画面推成HLS,供展示系统播放
-    push_hls_fps: float = 1.0,            # 推流输出帧率标注
+    push_hls_fps: float = 15.0,            # 推流输出帧率标注
     hls_segment_time: int = 2,             # 每个.ts分片时长(秒)
     hls_list_size: int = 5,                # index.m3u8保留的分片数量
     save_snapshot: bool = False,           # True则检测到目标时把这一帧直接落盘,供下游截图用

@@ -15,7 +15,16 @@ def parse_detection(result) -> list[dict]:
         return []
     dets = []
     for b in boxes:
-        d = {"cls": int(b.cls), "conf": float(b.conf), "xyxy": b.xyxy[0].tolist()}
+        cls_id = int(b.cls)
+        d = {
+            "cls": cls_id,
+            "cls_name": result.names[cls_id],  # 类别名称,来自模型自带的names映射
+            "conf": float(b.conf),
+            "xyxy": b.xyxy[0].tolist(),
+        }
+        # track_id 只有在用 model.track() 且这一帧成功跟踪到该目标时才存在,
+        # 单图推理(model.predict())或跟踪未确认时,这个key直接不出现,
+        # 而不是以 null 的形式占位。
         if b.id is not None:
             d["track_id"] = int(b.id[0])
         dets.append(d)
@@ -29,8 +38,10 @@ def parse_segmentation(result) -> list[dict]:
         return []
     dets = []
     for b, m in zip(boxes, masks):
+        cls_id = int(b.cls)
         d = {
-            "cls": int(b.cls),
+            "cls": cls_id,
+            "cls_name": result.names[cls_id],
             "conf": float(b.conf),
             "xyxy": b.xyxy[0].tolist(),
             "polygon": m.xy[0].tolist(),
@@ -40,6 +51,7 @@ def parse_segmentation(result) -> list[dict]:
         dets.append(d)
     return dets
 
+
 def parse_pose(result) -> list[dict]:
     keypoints = result.keypoints
     boxes = result.boxes
@@ -47,8 +59,10 @@ def parse_pose(result) -> list[dict]:
         return []
     dets = []
     for b, kp in zip(boxes, keypoints):
+        cls_id = int(b.cls)
         d = {
-            "cls": int(b.cls),
+            "cls": cls_id,
+            "cls_name": result.names[cls_id],
             "conf": float(b.conf),
             "xyxy": b.xyxy[0].tolist(),
             "keypoints": kp.xy[0].tolist(),
@@ -58,6 +72,7 @@ def parse_pose(result) -> list[dict]:
             d["track_id"] = int(b.id[0])
         dets.append(d)
     return dets
+
 
 def parse_result(result) -> dict:
     if result.masks is not None:
@@ -126,9 +141,9 @@ def build_stream_generator(
     stop_event: threading.Event | None = None,
     save_video_path: str | None = None,
     save_video_fps: float = 5.0,
-    target_fps: float =3.0,
+    target_fps: float | None = None,
     push_hls_dir: str | None = None,
-    push_hls_fps: float = 1.0,
+    push_hls_fps: float = 15.0,
     hls_segment_time: int = 3,
     hls_list_size: int = 5,
     snapshot_dir: str | None = None,
@@ -178,11 +193,12 @@ def build_stream_generator(
                 避免磁盘无限增长。
 
     snapshot_dir: 传入一个目录路径后,每当这一帧检测到目标(detections非空)
-                就把标注好的这一帧直接落盘保存为jpg,文件名是毫秒级时间戳。
-                这是给下游系统截图用的最准确方式 —— 用的是产生这条JSON
-                结果的同一帧原始数据,不存在"从视频画面里反推该在哪个时刻
-                截图"的对齐误差。返回的JSON里会带上 "snapshot" 字段(仅
-                文件名),下游拼上静态文件服务的URL前缀即可直接下载访问。
+                就把这一帧的原始画面(不带检测框/分割/关键点标注)直接落盘
+                保存为jpg,文件名是毫秒级时间戳。这是给下游系统截图用的
+                最准确方式 —— 用的是产生这条JSON结果的同一帧原始数据,
+                不存在"从视频画面里反推该在哪个时刻截图"的对齐误差。
+                返回的JSON里会带上 "snapshot" 字段(仅文件名),下游拼上
+                静态文件服务的URL前缀即可直接下载访问。
 
     probe_timeout: ffprobe探测视频源宽高的超时时间(秒)。HLS通常很快,
                 RTMP等协议可能耗时更长,超时会直接判为失败并抛出异常。
@@ -346,7 +362,9 @@ def build_stream_generator(
                     device=device, half=True, verbose=False,
                 )
 
-            need_annotated = video_writer is not None or push_proc is not None or snapshot_dir is not None
+            # snapshot现在存的是原始画面(不带标注),不再需要annotated,
+            # 所以这里不把 snapshot_dir 计入 need_annotated 的判断条件。
+            need_annotated = video_writer is not None or push_proc is not None
             annotated = results[0].plot() if need_annotated else None
 
             if video_writer is not None and annotated is not None:
@@ -382,11 +400,11 @@ def build_stream_generator(
                 not snapshot_new_targets_only or len(new_ids) > 0
             )
 
-            if snapshot_dir is not None and should_snapshot and annotated is not None:
+            if snapshot_dir is not None and should_snapshot:
                 import os
                 filename = f"{int(frame_time * 1000)}.jpg"
                 filepath = os.path.join(snapshot_dir, filename)
-                cv2.imwrite(filepath, annotated)
+                cv2.imwrite(filepath, frame)  # 存原始画面,不带检测框/分割/关键点标注
                 parsed["snapshot"] = filename  # 下游拼上静态文件服务前缀即可访问
                 if snapshot_new_targets_only:
                     parsed["new_track_ids"] = sorted(new_ids)  # 告诉下游这次是哪些新目标触发的
